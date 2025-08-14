@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RayLab</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    html,body{height:100%}
+    body{background:#0b0f14}
+    canvas{image-rendering:pixelated}
+    .panel{background:#0f172a;border:2px solid #0b1220}
+    .btn{background:#1f2937;border:1px solid #2b3a55}
+    .btn:hover{filter:brightness(1.1)}
+    .input{background:#0b1220;border:1px solid #20304d}
+    .label{color:#9fb2d1}
+    .tab{padding:.35rem .6rem;border:1px solid #22314f;border-bottom:none;border-top-left-radius:.5rem;border-top-right-radius:.5rem;background:#0c1220;cursor:pointer;white-space:nowrap}
+    .tab.active{background:#142035}
+    .row{display:grid;grid-template-columns:160px 1fr;gap:.5rem;align-items:center}
+    .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace}
+  </style>
+</head>
+<body class="text-slate-200">
+  <div class="w-full h-full grid grid-cols-1 xl:grid-cols-[640px_minmax(520px,1fr)] grid-rows-[auto_1fr_auto] gap-3 p-3">
+    <header class="panel rounded-xl px-3 py-2 col-span-1 xl:col-span-2 flex items-center gap-3">
+      <div class="text-sm label">tool bar</div>
+      <select id="shapePicker" class="input rounded px-2 py-1 text-sm">
+        <option value="sphere">sphere</option>
+        <option value="box">cube</option>
+        <option value="cone">cone</option>
+        <option value="pyramid">pyramid</option>
+      </select>
+      <button id="btnAdd" class="btn rounded-lg px-3 py-1.5">add</button>
+      <button id="btnDelete" class="btn rounded-lg px-3 py-1.5">delete</button>
+      <div class="w-px h-6 bg-slate-700 mx-1"></div>
+      <button id="btnViewport" class="btn rounded-lg px-3 py-1.5">viewport 480×360</button>
+      <button id="btnRender" class="btn rounded-lg px-3 py-1.5">render 1440×1080</button>
+      <button id="btnSave" class="btn rounded-lg px-3 py-1.5">save 1440×1080 png</button>
+      <button id="btnLoadOBJ" class="btn rounded-lg px-3 py-1.5">load OBJ</button>
+      <input id="fileOBJ" type="file" accept=".obj" class="hidden">
+      <div class="flex-1"></div>
+      <div id="status" class="text-xs text-slate-400">idle</div>
+    </header>
+
+    <main class="panel rounded-xl p-3 relative">
+      <div class="text-xs label mb-1">viewport</div>
+      <div class="grid place-items-center">
+        <canvas id="cv" width="480" height="360" class="rounded-xl" style="width:480px;height:360px"></canvas>
+      </div>
+      <div class="text-xs text-slate-400 mt-2">viewport 480×360. render 1440×1080. export 1440×1080.</div>
+    </main>
+
+    <aside class="panel rounded-xl p-0">
+      <div class="px-3 pt-3 text-sm label">properties</div>
+      <div class="mt-2 px-3 border-b border-slate-800 overflow-x-auto">
+        <div class="flex gap-2 min-w-max pr-2">
+          <button id="tabProps" class="tab active shrink-0">properties</button>
+          <button id="tabShading" class="tab shrink-0">shading</button>
+          <button id="tabRender" class="tab shrink-0">render</button>
+          <button id="tabCamera" class="tab shrink-0">camera</button>
+          <button id="tabLighting" class="tab shrink-0">lighting</button>
+        </div>
+      </div>
+      <div id="inspector" class="p-3 space-y-2 text-sm"></div>
+    </aside>
+
+    <footer class="panel rounded-xl px-3 py-2 col-span-1 xl:col-span-2 flex items-center justify-between">
+      <div class="text-xs text-slate-400">made with chatGPT 5 and Gemini.</div>
+      <div class="text-xs mono" id="hint"></div>
+    </footer>
+  </div>
+
+<script>
+/* ========= Math ========= */
+const EPS = 1e-4;
+const vec3=(x=0,y=0,z=0)=>({x,y,z});
+const add=(a,b)=>vec3(a.x+b.x,a.y+b.y,a.z+b.z);
+const sub=(a,b)=>vec3(a.x-b.x,a.y-b.y,a.z-b.z);
+const mul=(a,s)=>vec3(a.x*s,a.y*s,a.z*s);
+const dot=(a,b)=>a.x*b.x+a.y*b.y+a.z*b.z;
+const cross=(a,b)=>vec3(a.y*b.z-a.z*b.y,a.z*b.x-a.x*b.z,a.x*b.y-a.y*b.x);
+const len=a=>Math.hypot(a.x,a.y,a.z);
+const norm=a=>{const l=len(a)||1;return vec3(a.x/l,a.y/l,a.z/l)};
+function clamp01(v){return Math.min(1,Math.max(0,v));}
+
+/* ========= DOM ========= */
+const cv=document.getElementById('cv');
+const ctx=cv.getContext('2d',{willReadFrequently:true});
+let W=cv.width,H=cv.height;
+const statusEl=document.getElementById('status');
+const inspectorEl=document.getElementById('inspector');
+
+/* ========= Camera ========= */
+const cam={pos:vec3(0,1,4),yaw:0,pitch:0,fovDeg:60};
+function getBasis(){
+  const cy=Math.cos(cam.yaw), sy=Math.sin(cam.yaw);
+  const cp=Math.cos(cam.pitch), sp=Math.sin(cam.pitch);
+  const f=vec3(sy*cp, sp, -cy*cp);
+  const r=vec3(cy,0,sy);
+  const u=norm(cross(r,f));
+  return {f:norm(f), r:norm(r), u};
+}
+
+/* ========= Scene ========= */
+let objects=[];
+const ground={type:'plane',point:vec3(0,0,0),normal:vec3(0,1,0),color:vec3(0.8,0.8,0.8),specular:8,reflect:0,visible:true,casts:true};
+const light={pos:vec3(-2,5,2),intensity:1,color:vec3(1,1,1)}; // key light
+let selectedId=null;
+let inspectorTab='props';
+
+// render settings
+const settings={
+  samples:1,
+  softShadows:false,
+  shadowRadius:0.35,
+  shadowSamples:8,
+  emissiveCastShadows:true,
+  dofEnabled:false,
+  dofAperture:0.05,
+  dofFocus:5.0,
+  dofSamples:8
+};
+
+function newSphere(){
+  return {id:crypto.randomUUID(),type:'sphere',center:vec3(0,0.5,0),radius:0.5,color:vec3(0.9,0.3,0.3),specular:40,reflect:0.2,emissive:0,glass:0,ior:1.5,roughness:0.1,metallic:0,visible:true,casts:true};
+}
+function newBox(){
+  return {id:crypto.randomUUID(),type:'box',min:vec3(-0.5,0,-0.5),max:vec3(0.5,1,0.5),color:vec3(0.3,0.7,0.9),specular:20,reflect:0.15,emissive:0,glass:0,ior:1.5,roughness:0.2,metallic:0,visible:true,casts:true};
+}
+function newCone(){
+  return {id:crypto.randomUUID(),type:'cone',apex:vec3(0,1.2,0),height:1.2,radius:0.6,color:vec3(0.95,0.7,0.3),specular:20,reflect:0.1,emissive:0,glass:0,ior:1.5,roughness:0.25,metallic:0,visible:true,casts:true};
+}
+function newPyramid(){
+  return {id:crypto.randomUUID(),type:'pyramid',base:vec3(0,0,0),half:0.45,height:1.0,color:vec3(0.9,0.8,0.4),specular:20,reflect:0.1,emissive:0,glass:0,ior:1.5,roughness:0.3,metallic:0,visible:true,casts:true};
+}
+
+/* ========= Mesh and OBJ ========= */
+function newMesh(tris){
+  return {
+    id: crypto.randomUUID(),
+    type: 'mesh',
+    baseTris: tris.map(t=>({a:vec3(t.a.x,t.a.y,t.a.z), b:vec3(t.b.x,t.b.y,t.b.z), c:vec3(t.c.x,t.c.y,t.c.z)})), // immutable source
+    tris: tris, // world space gets written by applyMeshTransform
+    pos: vec3(0,0,0),
+    scale: vec3(1,1,1),
+    color: vec3(0.8,0.8,0.8),
+    specular: 20,
+    reflect: 0.1,
+    emissive: 0,
+    glass: 0,
+    ior: 1.5,
+    roughness: 0.2,
+    metallic: 0.0,
+    visible: true,
+    casts: true
+  };
+}
+
+function parseOBJ(text){
+  const vs = [];
+  const tris = [];
+  const lines = text.split(/\r?\n/);
+  for(const line of lines){
+    const l = line.trim();
+    if(l === '' || l[0] === '#') continue;
+    const parts = l.split(/\s+/);
+    if(parts[0] === 'v' && parts.length >= 4){
+      const x = parseFloat(parts[1]), y = parseFloat(parts[2]), z = parseFloat(parts[3]);
+      vs.push(vec3(x,y,z));
+    } else if(parts[0] === 'f' && parts.length >= 4){
+      const idx = parts.slice(1).map(tok => parseInt(tok.split('/')[0],10));
+      for(let i=1;i<idx.length-1;i++){
+        const a = vs[(idx[0]   > 0 ? idx[0]   -1 : vs.length + idx[0])];
+        const b = vs[(idx[i]   > 0 ? idx[i]   -1 : vs.length + idx[i])];
+        const c = vs[(idx[i+1] > 0 ? idx[i+1] -1 : vs.length + idx[i+1])];
+        if(a && b && c) tris.push({a,b,c});
+      }
+    }
+  }
+  return tris;
+}
+
+function bboxOfTris(tris){
+  if(tris.length === 0) return {min:vec3(0,0,0), max:vec3(0,0,0)};
+  let minx= Infinity,miny= Infinity,minz= Infinity;
+  let maxx=-Infinity,maxy=-Infinity,maxz=-Infinity;
+  for(const t of tris){
+    for(const v of [t.a,t.b,t.c]){
+      if(v.x<minx)minx=v.x; if(v.y<miny)miny=v.y; if(v.z<minz)minz=v.z;
+      if(v.x>maxx)maxx=v.x; if(v.y>maxy)maxy=v.y; if(v.z>maxz)maxz=v.z;
+    }
+  }
+  return {min:vec3(minx,miny,minz), max:vec3(maxx,maxy,maxz)};
+}
+
+function transformMeshTris(tris, scale=1, offset=vec3(0,0,0)){
+  const out = new Array(tris.length);
+  for(let i=0;i<tris.length;i++){
+    const t = tris[i];
+    out[i] = { a: add(mul(t.a,scale),offset), b: add(mul(t.b,scale),offset), c: add(mul(t.c,scale),offset) };
+  }
+  return out;
+}
+
+function applyMeshTransform(m){
+  const s=m.scale||vec3(1,1,1); const p=m.pos||vec3(0,0,0);
+  m.tris = m.baseTris.map(t=>({
+    a: add(vec3(t.a.x*s.x, t.a.y*s.y, t.a.z*s.z), p),
+    b: add(vec3(t.b.x*s.x, t.b.y*s.y, t.b.z*s.z), p),
+    c: add(vec3(t.c.x*s.x, t.c.y*s.y, t.c.z*s.z), p),
+  }));
+}
+
+/* ========= Rays and intersections ========= */
+const ray=(o,d)=>({o,d});
+function intersectSphere(r,s){
+  const oc=sub(r.o,s.center);const a=dot(r.d,r.d);const b=2*dot(oc,r.d);const c=dot(oc,oc)-s.radius*s.radius;const D=b*b-4*a*c; if(D<0) return null; const sd=Math.sqrt(D); const t1=(-b-sd)/(2*a); const t2=(-b+sd)/(2*a); let t=Infinity; if(t1>EPS) t=t1; else if(t2>EPS) t=t2; else return null; const p=add(r.o,mul(r.d,t)); const n=norm(sub(p,s.center)); return {t,p,n}; }
+
+function intersectBox(r,b){
+  let tmin=-Infinity,tmax=Infinity;
+  for(const ax of ['x','y','z']){
+    const inv=1/(r.d[ax]||1e-9);
+    let t0=(b.min[ax]-r.o[ax])*inv; let t1=(b.max[ax]-r.o[ax])*inv;
+    if(t0>t1){ const tmp=t0; t0=t1; t1=tmp; }
+    tmin=Math.max(tmin,t0);
+    tmax=Math.min(tmax,t1);
+    if(tmax<tmin) return null;
+  }
+  const t=tmin>EPS?tmin:(tmax>EPS?tmax:null); if(t===null) return null;
+  const p=add(r.o,mul(r.d,t));
+  const dx=Math.min(Math.abs(p.x-b.min.x), Math.abs(p.x-b.max.x));
+  const dy=Math.min(Math.abs(p.y-b.min.y), Math.abs(p.y-b.max.y));
+  const dz=Math.min(Math.abs(p.z-b.min.z), Math.abs(p.z-b.max.z));
+  let n=vec3(0,0,0);
+  if(dx<=dy && dx<=dz) n=vec3(p.x<(b.min.x+b.max.x)/2?-1:1,0,0);
+  else if(dy<=dx && dy<=dz) n=vec3(0,p.y<(b.min.y+b.max.y)/2?-1:1,0);
+  else n=vec3(0,0,p.z<(b.min.z+b.max.z)/2?-1:1);
+  return {t,p,n};
+}
+
+function intersectPlane(r,pl){ const denom=dot(r.d,pl.normal); if(Math.abs(denom)<EPS) return null; const t=dot(sub(pl.point,r.o),pl.normal)/denom; if(t<=EPS) return null; const p=add(r.o,mul(r.d,t)); return {t,p,n:pl.normal}; }
+
+function intersectCone(r,c){
+  const ax=c.apex; const h=c.height; const rad=c.radius;
+  const xo=r.o.x-ax.x, yo=r.o.y-ax.y, zo=r.o.z-ax.z;
+  const dx=r.d.x, dy=r.d.y, dz=r.d.z;
+  const k=rad/h; const k2=k*k;
+  const A=dx*dx+dz*dz-k2*dy*dy;
+  const B=2*(xo*dx+zo*dz-k2*yo*dy);
+  const C=xo*xo+zo*zo-k2*yo*yo;
+  let tSide=null;
+  if(Math.abs(A)>1e-9){
+    const D=B*B-4*A*C; if(D>=0){ const sD=Math.sqrt(D); const t1=(-B-sD)/(2*A); const t2=(-B+sD)/(2*A);
+      const pick=(tt)=>{ if(tt>EPS){ const yL=yo+dy*tt; if(yL<=EPS && yL>=-h-EPS) return tt; } return null; };
+      tSide=pick(t1); if(tSide===null) tSide=pick(t2);
+    }
+  }
+  let tCap=null; if(Math.abs(dy)>1e-9){ const tt=((-h)-yo)/dy; if(tt>EPS){ const xh=xo+dx*tt, zh=zo+dz*tt; if(xh*xh+zh*zh<=rad*rad+1e-7) tCap=tt; } }
+  if(tSide!==null && (tCap===null || tSide<tCap)){
+    const t=tSide; const p=add(r.o,mul(r.d,t));
+    const px=p.x-ax.x, py=p.y-ax.y, pz=p.z-ax.z;
+    let n=norm(vec3(px, -k2*py, pz));
+    if(dot(n,r.d)>0) n=mul(n,-1);
+    return {t,p,n};
+  }
+  if(tCap!==null){ const p=add(r.o,mul(r.d,tCap)); let n=vec3(0,1,0); if(dot(n,r.d)>0) n=mul(n,-1); return {t:tCap,p,n}; }
+  return null;
+}
+
+function intersectTriangle(r,a,b,c){
+  const e1=sub(b,a), e2=sub(c,a);
+  const pvec=cross(r.d,e2); const det=dot(e1,pvec);
+  if(Math.abs(det)<1e-8) return null;
+  const inv=1/det; const tvec=sub(r.o,a);
+  const u=dot(tvec,pvec)*inv; if(u<0||u>1) return null;
+  const qvec=cross(tvec,e1);
+  const v=dot(r.d,qvec)*inv; if(v<0||u+v>1) return null;
+  const t=dot(e2,qvec)*inv; if(t<=EPS) return null;
+  let n=norm(cross(e1,e2));
+  if(dot(n,r.d)>0) n=mul(n,-1);
+  const p=add(r.o,mul(r.d,t));
+  return {t,p,n};
+}
+
+function intersectPyramid(r,py){
+  const bc=py.base; const h=py.height; const half=py.half; const apex=vec3(bc.x, bc.y+h, bc.z);
+  const v00=vec3(bc.x-half, bc.y, bc.z-half);
+  const v10=vec3(bc.x+half, bc.y, bc.z-half);
+  const v11=vec3(bc.x+half, bc.y, bc.z+half);
+  const v01=vec3(bc.x-half, bc.y, bc.z+half);
+  const tris=[[apex,v00,v10],[apex,v10,v11],[apex,v11,v01],[apex,v01,v00],[v00,v10,v11],[v00,v11,v01]];
+  let best=null; for(const t of tris){ const hit=intersectTriangle(r,t[0],t[1],t[2]); if(hit && (!best||hit.t<best.t)) best=hit; }
+  return best;
+}
+
+function intersectMesh(r, m){
+  let best=null;
+  for(const t of m.tris){
+    const hit=intersectTriangle(r, t.a, t.b, t.c);
+    if(hit && (!best || hit.t<best.t)) best=hit;
+  }
+  return best;
+}
+
+function sceneIntersect(r){
+  let best=null, obj=null;
+  if(ground.visible){ const g=intersectPlane(r,ground); if(g){best=g; obj=ground;} }
+  for(const o of objects){ if(!o.visible) continue; let h=null; if(o.type==='sphere') h=intersectSphere(r,o); else if(o.type==='box') h=intersectBox(r,o); else if(o.type==='cone') h=intersectCone(r,o); else if(o.type==='pyramid') h=intersectPyramid(r,o); else if(o.type==='mesh') h=intersectMesh(r,o); if(h && (!best || h.t<best.t)){ best=h; obj=o; } }
+  return best?{...best,obj}:null;
+}
+
+/* ========= Lighting helpers ========= */
+function inShadowFrom(p, lpos, maxDist, excludeId=null){
+  const L=sub(lpos,p); const dist=maxDist ?? len(L); const dir=norm(L); const sr=ray(add(p,mul(dir,1e-3)),dir); // slightly larger offset for numerical stability on sharp cones/pyramids
+  if(ground.visible && ground.casts){ const g=intersectPlane(sr,ground); if(g && g.t<dist) return true; }
+  for(const o of objects){ if(!o.visible||!o.casts) continue; if(excludeId && o.id===excludeId) continue; let h=null; if(o.type==='sphere') h=intersectSphere(sr,o); else if(o.type==='box') h=intersectBox(sr,o); else if(o.type==='cone') h=intersectCone(sr,o); else if(o.type==='pyramid') h=intersectPyramid(sr,o); else if(o.type==='mesh') h=intersectMesh(sr,o); if(h && h.t<dist) return true; }
+  return false;
+}
+
+function emissiveLights(){
+  const arr=[];
+  for(const o of objects){ if(!o.visible) continue; const em=(o.emissive||0); if(em<=0) continue; let pos=vec3(0,0,0), rad=0.2; if(o.type==='sphere'){ pos=o.center; rad=o.radius; } else if(o.type==='box'){ pos=vec3((o.min.x+o.max.x)/2,(o.min.y+o.max.y)/2,(o.min.z+o.min.z)/2); rad=Math.max(0.2, Math.max(o.max.x-o.min.x, o.max.y-o.min.y, o.max.z-o.min.z)/2); } else if(o.type==='cone'){ pos=vec3(o.apex.x, o.apex.y - o.height*0.75, o.apex.z); rad=Math.max(0.15, o.radius*0.5); } else if(o.type==='pyramid'){ pos=vec3(o.base.x, o.base.y + o.height*0.25, o.base.z); rad=Math.max(0.15, o.half); } else if(o.type==='mesh'){ const bb=bboxOfTris(o.tris); pos=vec3((bb.min.x+bb.max.x)/2,(bb.min.y+bb.max.y)/2,(bb.min.z+bb.max.z)/2); rad=Math.max(0.2, Math.max(bb.max.x-bb.min.x, bb.max.y-bb.min.y, bb.max.z-bb.min.z)/2); } arr.push({pos, intensity:em, color:o.color, isEmissive:true, srcId:o.id, radius:rad}); }
+  return arr;
+}
+
+function sampleDisk2D(radius){ const a=2*Math.PI*Math.random(); const r=radius*Math.sqrt(Math.random()); return {x:r*Math.cos(a), y:r*Math.sin(a)}; }
+
+/* ========= Fresnel, refraction, helpers ========= */
+function refract(I, N, ior){ let cosi = clamp01(-dot(I,N)); let etai = 1.0, etat = ior; let n = N; if(dot(I,N) > 0){ n = mul(N,-1); const tmp = etai; etai = etat; etat = tmp; cosi = clamp01(-dot(I,n)); } const eta = etai/etat; const k = 1 - eta*eta*(1 - cosi*cosi); if(k < 0) return null; return norm( add( mul(I, eta), mul(n, eta*cosi - Math.sqrt(k)) ) ); }
+function fresnelSchlick(cosX, ior){ const r0 = ((ior - 1)/(ior + 1))**2; return r0 + (1 - r0) * (1 - cosX)**5; }
+function fresnelSchlickRGB(cosX, F0){ return vec3(
+  F0.x + (1 - F0.x) * Math.pow(1 - cosX, 5),
+  F0.y + (1 - F0.y) * Math.pow(1 - cosX, 5),
+  F0.z + (1 - F0.z) * Math.pow(1 - cosX, 5)
+);} 
+
+function perturbDir(dir, rough){
+  const a=Math.max(0, rough||0);
+  if(a<0.001) return norm(dir);
+  const axis = Math.abs(dir.y) < 0.999 ? vec3(0,1,0) : vec3(1,0,0);
+  const t = norm(cross(axis, dir));
+  const b = norm(cross(dir, t));
+  const d = sampleDisk2D(a*0.6);
+  return norm(add(dir, add(mul(t,d.x), mul(b,d.y))));
+}
+
+/* ========= Shading ========= */
+function shade(r,depth=0){
+  if(depth>4) return vec3(0,0,0);
+  const hit=sceneIntersect(r); if(!hit) return vec3(0,0,0);
+  const {p,n,obj}=hit;
+
+  let base=obj.color;
+  if(obj===ground){ const c=((Math.floor(p.x*1.5)+Math.floor(p.z*1.5))&1)?0.2:0.8; base=vec3(c,c,c); }
+
+  const metal = clamp01(obj.metallic||0);
+  const rough = clamp01(obj.roughness||0);
+  const F0 = vec3(
+    (1-metal)*0.04 + metal*base.x,
+    (1-metal)*0.04 + metal*base.y,
+    (1-metal)*0.04 + metal*base.z
+  );
+  const specPow = 2 + Math.pow(1 - rough, 4) * 500;
+
+  let col=vec3(0.02,0.02,0.02);
+  const lights=[{pos:light.pos,intensity:light.intensity,color:light.color,isEmissive:false,radius:settings.shadowRadius}, ...emissiveLights()];
+  const LIGHT_BOOST = 4; const EMISSIVE_VISUAL_SCALE = 0.25;
+
+  for(const L of lights){
+    if(settings.softShadows){
+      let acc=vec3(0,0,0); const S=Math.max(1, settings.shadowSamples|0); const rad=Math.max(0.0001, L.radius||settings.shadowRadius);
+      for(let i=0;i<S;i++){
+        const d=sampleDisk2D(rad); const lp=add(L.pos, vec3(d.x,0,d.y)); const ldir=norm(sub(lp,p)); const dist=len(sub(lp,p)); const falloff=1/(1+0.1*dist*dist); const occluded=inShadowFrom(p, lp, dist, L.isEmissive?L.srcId:null); const vis = L.isEmissive ? (settings.emissiveCastShadows ? (occluded?0:1) : 1) : (occluded?0:1);
+        const ndotl=Math.max(0, dot(n,ldir));
+        const view=mul(r.d,-1);
+        const h=norm(add(ldir,view));
+        const specTerm=Math.pow(Math.max(0,dot(n,h)), specPow);
+        const F = fresnelSchlickRGB(Math.max(0,dot(h,view)), F0);
+        const diffuse = mul(vec3(base.x*(1-metal)*L.color.x, base.y*(1-metal)*L.color.y, base.z*(1-metal)*L.color.z), ndotl * vis * L.intensity * falloff * LIGHT_BOOST);
+        const specular = mul(vec3(F.x*L.color.x, F.y*L.color.y, F.z*L.color.z), specTerm * vis * L.intensity * falloff * LIGHT_BOOST);
+        acc=add(acc, add(diffuse, specular));
+      }
+      col=add(col, mul(acc, 1/S));
+    } else {
+      const ldir=norm(sub(L.pos,p)); const dist=len(sub(L.pos,p)); const falloff = 1/(1+0.1*dist*dist); const occluded=inShadowFrom(p, L.pos, dist, L.isEmissive?L.srcId:null); const vis = L.isEmissive ? (settings.emissiveCastShadows ? (occluded?0:1) : 1) : (occluded?0.1:1);
+      const ndotl=Math.max(0,dot(n,ldir));
+      const view=mul(r.d,-1);
+      const h=norm(add(ldir,view));
+      const specTerm=Math.pow(Math.max(0,dot(n,h)), specPow);
+      const F = fresnelSchlickRGB(Math.max(0,dot(h,view)), F0);
+      const diffuse = mul(vec3(base.x*(1-metal)*L.color.x, base.y*(1-metal)*L.color.y, base.z*(1-metal)*L.color.z), ndotl * vis * L.intensity * falloff * LIGHT_BOOST);
+      const specular = mul(vec3(F.x*L.color.x, F.y*L.color.y, F.z*L.color.z), specTerm * vis * L.intensity * falloff * LIGHT_BOOST);
+      col = add(col, add(diffuse, specular));
+    }
+  }
+
+  if((obj.emissive||0) > 0){ col = add(col, mul(obj.color, obj.emissive * LIGHT_BOOST * EMISSIVE_VISUAL_SCALE)); }
+
+  let result = col;
+
+  const glass = clamp01(obj.glass||0);
+  if(glass > 0){ let N = n; if(dot(r.d, N) > 0) N = mul(N,-1); const ior = Math.max(1.0, obj.ior||1.5); const refr = refract(r.d, N, ior); const cosX = clamp01(-dot(r.d, N)); const Fr = fresnelSchlick(cosX, ior); const R = norm( sub(r.d, mul(N, 2*dot(r.d,N))) ); const reflCol = shade(ray(add(p, mul(R, EPS)), perturbDir(R, rough)), depth+1); let refrCol = vec3(0,0,0); if(refr){ const T = shade(ray(add(p, mul(refr, EPS)), refr), depth+1); refrCol = vec3(T.x*base.x, T.y*base.y, T.z*base.z); } else refrCol = reflCol; const glassCol = add( mul(reflCol, Fr), mul(refrCol, 1-Fr) ); result = add( mul(result, 1-glass), mul(glassCol, glass) ); }
+
+  const refl = (obj.reflect||0) * (1 - (obj.glass||0));
+  if(refl>0){
+    const rd=sub(r.d,mul(n,2*dot(r.d,n)));
+    const rdB=perturbDir(norm(rd), rough);
+    const rr=ray(add(p,mul(rdB,EPS)),rdB);
+    let rc=shade(rr,depth+1);
+    // Metallic tints mirror reflections: blend rc with rc*base when metallic>0
+    const rcTint = add(mul(rc, 1-metal), mul(vec3(rc.x*base.x, rc.y*base.y, rc.z*base.z), metal));
+    result=add(mul(result,1-refl),mul(rcTint,refl));
+  }
+
+  return vec3(clamp01(result.x),clamp01(result.y),clamp01(result.z));
+}
+
+/* ========= Core render ========= */
+function computeImage(w,h){
+  const img=new ImageData(w,h); const data=img.data; const {f,r,u}=getBasis(); const fov=cam.fovDeg*Math.PI/180; const scale=Math.tan(fov*0.5)*2; const aspect=w/h; const SPP=Math.max(1, settings.samples|0); const DSP = settings.dofEnabled ? Math.max(1, settings.dofSamples|0) : 1; const lensR = Math.max(0, settings.dofAperture||0); const focusD = Math.max(0.01, settings.dofFocus||1);
+  for(let y=0;y<h;y++){
+    for(let x=0;x<w;x++){
+      let accum=vec3(0,0,0);
+      for(let s=0;s<SPP;s++){
+        for(let dsi=0; dsi<DSP; dsi++){
+          const jx=(Math.random()-0.5)/w, jy=(Math.random()-0.5)/h; const ndcX=((x+0.5)+jx)/w*2-1, ndcY=1-((y+0.5)+jy)/h*2; const px=ndcX*aspect*scale*0.5, py=ndcY*scale*0.5; const dir0=norm(add(add(f,mul(r,px)),mul(u,py))); let ro = cam.pos, rd = dir0; if(settings.dofEnabled && lensR>0){ const tFocus = focusD / Math.max(1e-4, dot(dir0, f)); const pFocus = add(cam.pos, mul(dir0, tFocus)); const d2 = sampleDisk2D(lensR); const lensOffset = add(mul(r, d2.x), mul(u, d2.y)); ro = add(cam.pos, lensOffset); rd = norm(sub(pFocus, ro)); } const col=shade(ray(ro,rd)); accum=add(accum,col); }
+      }
+      const c=mul(accum,1/(SPP*DSP)); const i=(y*w+x)*4; data[i]=Math.round(c.x*255); data[i+1]=Math.round(c.y*255); data[i+2]=Math.round(c.z*255); data[i+3]=255;
+    }
+    if(y%8===0) statusEl.textContent=`render ${Math.round((y/h)*100)}%`;
+  }
+  return img;
+}
+
+function render(w=W,h=H){ const img=computeImage(w,h); statusEl.textContent=`done ${w}×${h}`; cv.width=w; cv.height=h; cv.style.width='480px'; cv.style.height='360px'; ctx.putImageData(img,0,0); }
+
+function exportPNG(w=1440,h=1080){ statusEl.textContent='exporting 1440×1080…'; setTimeout(()=>{ const img=computeImage(w,h); const off=document.createElement('canvas'); off.width=w; off.height=h; const octx=off.getContext('2d'); octx.putImageData(img,0,0); off.toBlob(b=>{ const url=URL.createObjectURL(b); const a=document.createElement('a'); a.href=url; a.download='render_1440x1080.png'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(()=>URL.revokeObjectURL(url),800); statusEl.textContent='saved 1440×1080 png'; }); },0); }
+
+/* ========= UI ========= */
+function buildInspector(){
+  const o=objects.find(x=>x.id===selectedId);
+  const container=document.createElement('div');
+  if(!o && !['camera','lighting','render'].includes(inspectorTab)){
+    inspectorEl.innerHTML='<div class="text-xs text-slate-400">select an object.</div>'; return;
+  }
+  function numRow(label,get,set,step=0.1){ const r=document.createElement('div'); r.className='row'; r.innerHTML=`<label class="label text-xs">${label}</label><input class="input rounded px-2 py-1" type="number" step="${step}" value="${get()}">`; r.querySelector('input').onchange=e=>{ set(parseFloat(e.target.value)); requestViewport(); }; container.appendChild(r); }
+  function vecRow(label,v){ const r=document.createElement('div'); r.className='row'; r.innerHTML=`<label class="label text-xs">${label}</label><div class="grid grid-cols-3 gap-2"><input class="input rounded px-2 py-1" type="number" step="0.1" value="${v.x}"><input class="input rounded px-2 py-1" type="number" step="0.1" value="${v.y}"><input class="input rounded px-2 py-1" type="number" step="0.1" value="${v.z}"></div>`; const xs=r.querySelectorAll('input'); xs[0].onchange=e=>{v.x=parseFloat(e.target.value);requestViewport();}; xs[1].onchange=e=>{v.y=parseFloat(e.target.value);requestViewport();}; xs[2].onchange=e=>{v.z=parseFloat(e.target.value);requestViewport();}; container.appendChild(r); }
+  function meshVecRow(label,obj,key){ const r=document.createElement('div'); r.className='row'; const v=obj[key]; r.innerHTML=`<label class="label text-xs">${label}</label><div class="grid grid-cols-3 gap-2"><input class="input rounded px-2 py-1" type="number" step="0.1" value="${v.x}"><input class="input rounded px-2 py-1" type="number" step="0.1" value="${v.y}"><input class="input rounded px-2 py-1" type="number" step="0.1" value="${v.z}"></div>`; const xs=r.querySelectorAll('input'); xs[0].onchange=e=>{obj[key].x=parseFloat(e.target.value)||0; applyMeshTransform(obj); requestViewport();}; xs[1].onchange=e=>{obj[key].y=parseFloat(e.target.value)||0; applyMeshTransform(obj); requestViewport();}; xs[2].onchange=e=>{obj[key].z=parseFloat(e.target.value)||0; applyMeshTransform(obj); requestViewport();}; container.appendChild(r); }
+
+  if(inspectorTab==='props'){
+    if(o){
+      if(o.type==='sphere'){ vecRow('position', o.center); numRow('radius',()=>o.radius,v=>o.radius=v,0.05); }
+      else if(o.type==='box'){ vecRow('min', o.min); vecRow('max', o.max); }
+      else if(o.type==='cone'){ vecRow('apex', o.apex); numRow('height',()=>o.height,v=>o.height=v,0.05); numRow('radius',()=>o.radius,v=>o.radius=v,0.05); }
+      else if(o.type==='pyramid'){ vecRow('base center', o.base); numRow('half size',()=>o.half,v=>o.half=v,0.05); numRow('height',()=>o.height,v=>o.height=v,0.05); }
+      else if(o.type==='mesh'){
+        meshVecRow('position', o, 'pos');
+        meshVecRow('scale xyz', o, 'scale');
+        const r=document.createElement('div'); r.className='text-xs text-slate-400'; r.textContent=`triangles: ${o.tris.length}`; container.appendChild(r);
+      }
+    }
+  } else if(inspectorTab==='shading'){
+    const any=o||{};
+    vecRow('color', any.color);
+    numRow('roughness 0..1',()=>any.roughness ?? 0.2, v=>any.roughness=Math.max(0,Math.min(1,v||0)), 0.01);
+    numRow('metallic 0..1',()=>any.metallic ?? 0, v=>any.metallic=Math.max(0,Math.min(1,v||0)), 0.01);
+    numRow('reflect',()=>any.reflect ?? 0, v=>any.reflect=v,0.05);
+    numRow('emissive',()=>any.emissive ?? 0, v=>any.emissive=v,0.05);
+    numRow('glass 0..1',()=>any.glass ?? 0, v=>any.glass=Math.max(0,Math.min(1,v)),0.01);
+    numRow('ior',()=>any.ior ?? 1.5, v=>any.ior=v,0.01);
+  } else if(inspectorTab==='render'){
+    if(o){ const r0=document.createElement('div'); r0.className='row'; r0.innerHTML=`<label class="label text-xs">visible</label><input type="checkbox" ${o.visible?'checked':''}>`; r0.querySelector('input').onchange=e=>{o.visible=e.target.checked; requestViewport();}; container.appendChild(r0); const r1=document.createElement('div'); r1.className='row'; r1.innerHTML=`<label class="label text-xs">cast shadows</label><input type="checkbox" ${o.casts?'checked':''}>`; r1.querySelector('input').onchange=e=>{o.casts=e.target.checked; requestViewport();}; container.appendChild(r1); const hr1=document.createElement('div'); hr1.className='my-2 border-b border-slate-800'; container.appendChild(hr1); }
+    const r2=document.createElement('div'); r2.className='row'; r2.innerHTML=`<label class="label text-xs">samples per pixel</label><input class="input rounded px-2 py-1" type="number" step="1" min="1" value="${settings.samples}">`; r2.querySelector('input').onchange=e=>{ settings.samples=Math.max(1,Math.round(parseFloat(e.target.value)||1)); requestViewport(); }; container.appendChild(r2);
+    const r3=document.createElement('div'); r3.className='row'; r3.innerHTML=`<label class="label text-xs">soft shadows (all lights)</label><input type="checkbox" ${settings.softShadows?'checked':''}>`; r3.querySelector('input').onchange=e=>{ settings.softShadows=e.target.checked; requestViewport(); }; container.appendChild(r3);
+    const r4=document.createElement('div'); r4.className='row'; r4.innerHTML=`<label class="label text-xs">shadow radius</label><input class="input rounded px-2 py-1" type="number" step="0.05" value="${settings.shadowRadius}">`; r4.querySelector('input').onchange=e=>{ settings.shadowRadius=parseFloat(e.target.value)||0; requestViewport(); }; container.appendChild(r4);
+    const r5=document.createElement('div'); r5.className='row'; r5.innerHTML=`<label class="label text-xs">shadow samples</label><input class="input rounded px-2 py-1" type="number" step="1" min="1" value="${settings.shadowSamples}">`; r5.querySelector('input').onchange=e=>{ settings.shadowSamples=Math.max(1,Math.round(parseFloat(e.target.value)||1)); requestViewport(); }; container.appendChild(r5);
+    const r6=document.createElement('div'); r6.className='row'; r6.innerHTML=`<label class="label text-xs">emissive lights cast shadows</label><input type="checkbox" ${settings.emissiveCastShadows?'checked':''}>`; r6.querySelector('input').onchange=e=>{ settings.emissiveCastShadows=e.target.checked; requestViewport(); }; container.appendChild(r6);
+    const hr2=document.createElement('div'); hr2.className='my-2 border-b border-slate-800'; container.appendChild(hr2);
+    const d0=document.createElement('div'); d0.className='row'; d0.innerHTML=`<label class="label text-xs">depth of field</label><input type="checkbox" ${settings.dofEnabled?'checked':''}>`; d0.querySelector('input').onchange=e=>{ settings.dofEnabled=e.target.checked; requestViewport(); }; container.appendChild(d0);
+    const d1=document.createElement('div'); d1.className='row'; d1.innerHTML=`<label class="label text-xs">focus distance</label><input class="input rounded px-2 py-1" type="number" step="0.05" value="${settings.dofFocus}">`; d1.querySelector('input').onchange=e=>{ settings.dofFocus=Math.max(0.01,parseFloat(e.target.value)||5); requestViewport(); }; container.appendChild(d1);
+    const d2=document.createElement('div'); d2.className='row'; d2.innerHTML=`<label class="label text-xs">aperture radius</label><input class="input rounded px-2 py-1" type="number" step="0.005" value="${settings.dofAperture}">`; d2.querySelector('input').onchange=e=>{ settings.dofAperture=Math.max(0,parseFloat(e.target.value)||0); requestViewport(); }; container.appendChild(d2);
+    const d3=document.createElement('div'); d3.className='row'; d3.innerHTML=`<label class="label text-xs">dof samples</label><input class="input rounded px-2 py-1" type="number" step="1" min="1" value="${settings.dofSamples}">`; d3.querySelector('input').onchange=e=>{ settings.dofSamples=Math.max(1,Math.round(parseFloat(e.target.value)||1)); requestViewport(); }; container.appendChild(d3);
+  } else if(inspectorTab==='camera'){
+    vecRow('cam pos', cam.pos); numRow('yaw', ()=>cam.yaw, v=>cam.yaw=v, 0.01); numRow('pitch', ()=>cam.pitch, v=>cam.pitch=v, 0.01); numRow('fov', ()=>cam.fovDeg, v=>cam.fovDeg=v, 1);
+  } else if(inspectorTab==='lighting'){
+    vecRow('light pos', light.pos); numRow('intensity', ()=>light.intensity, v=>light.intensity=v, 0.05);
+  }
+  inspectorEl.innerHTML=''; inspectorEl.appendChild(container);
+}
+
+function refreshTabs(){
+  document.getElementById('tabProps').classList.toggle('active', inspectorTab==='props');
+  document.getElementById('tabShading').classList.toggle('active', inspectorTab==='shading');
+  document.getElementById('tabRender').classList.toggle('active', inspectorTab==='render');
+  document.getElementById('tabCamera').classList.toggle('active', inspectorTab==='camera');
+  document.getElementById('tabLighting').classList.toggle('active', inspectorTab==='lighting');
+  buildInspector();
+}
+['tabProps','tabShading','tabRender','tabCamera','tabLighting'].forEach(id=>{ document.getElementById(id).onclick=()=>{ inspectorTab=id==='tabProps'?'props':id==='tabShading'?'shading':id==='tabRender'?'render':id==='tabCamera'?'camera':'lighting'; refreshTabs(); }; });
+
+// Add and delete
+ document.getElementById('btnAdd').onclick=()=>{ const t=document.getElementById('shapePicker').value; const o=(t==='sphere')?newSphere():(t==='box')?newBox():(t==='cone')?newCone():newPyramid(); objects.push(o); selectedId=o.id; buildInspector(); requestViewport(); };
+ document.getElementById('btnDelete').onclick=()=>{ if(!selectedId) return; objects=objects.filter(o=>o.id!==selectedId); selectedId=null; buildInspector(); requestViewport(); };
+
+// Viewport and renders
+const VIEW_W=480, VIEW_H=360;
+document.getElementById('btnViewport').onclick=()=>{ W=VIEW_W; H=VIEW_H; render(W,H); };
+document.getElementById('btnRender').onclick=()=>{ W=1440; H=1080; render(W,H); };
+
+document.getElementById('btnSave').onclick=()=>{ exportPNG(1440,1080); };
+
+// OBJ loader UI
+const fileOBJ = document.getElementById('fileOBJ');
+document.getElementById('btnLoadOBJ').onclick=()=> fileOBJ.click();
+fileOBJ.addEventListener('change', async (e)=>{
+  const f=e.target.files && e.target.files[0];
+  if(!f) return;
+  statusEl.textContent = 'reading obj…';
+  const text = await f.text();
+  statusEl.textContent = 'parsing…';
+  let tris = parseOBJ(text);
+  if(tris.length===0){ statusEl.textContent='no triangles found'; return; }
+  // autoscale to about unit size and drop on ground at y=0
+  const bb = bboxOfTris(tris);
+  const size = Math.max(bb.max.x-bb.min.x, bb.max.y-bb.min.y, bb.max.z-bb.min.z) || 1;
+  const scale = 1/size; // fits into ~1 unit box
+  const center = vec3((bb.min.x+bb.max.x)/2, bb.min.y, (bb.min.z+bb.max.z)/2);
+  const offset = vec3(-center.x*scale, 0, -center.z*scale);
+  tris = transformMeshTris(tris, scale, offset);
+  const mesh = newMesh(tris);
+  mesh.color = vec3(0.75,0.8,0.9);
+  mesh.roughness = 0.35;
+  // initialize transform controls
+  mesh.pos = vec3(0, 0, 0);
+  mesh.scale = vec3(1, 1, 1);
+  applyMeshTransform(mesh);
+  objects.push(mesh);
+  selectedId = mesh.id;
+  statusEl.textContent = `loaded ${tris.length} tris`;
+  refreshTabs();
+  requestViewport();
+  fileOBJ.value = '';
+});
+
+/* ========= Selection ========= */
+cv.addEventListener('click',e=>{ const rect=cv.getBoundingClientRect(); const sx=(e.clientX-rect.left)*(cv.width/rect.width); const sy=(e.clientY-rect.top)*(cv.height/rect.height); const {f,r,u}=getBasis(); const fov=cam.fovDeg*Math.PI/180; const scale=Math.tan(fov*0.5)*2; const aspect=cv.width/cv.height; const ndcX=(sx+0.5)/cv.width*2-1; const ndcY=1-(sy+0.5)/cv.height*2; const px=ndcX*aspect*scale*0.5; const py=ndcY*scale*0.5; const dir=norm(add(add(f,mul(r,px)),mul(u,py))); const pick=sceneIntersect(ray(cam.pos,dir)); if(pick && pick.obj!==ground){ selectedId=pick.obj.id; refreshTabs(); } });
+
+// prevent arrow keys from scrolling
+window.addEventListener('keydown', e=>{ if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault(); });
+
+function requestViewport(){ clearTimeout(requestViewport.tid); requestViewport.tid=setTimeout(()=>render(VIEW_W,VIEW_H), 30); }
+
+// bootstrap scene
+objects = [
+  {
+    ...newSphere(),
+    center: vec3(0, 1, 0),
+    radius: 1,
+    color: vec3(1.5, 0, 0.1), // red=1.5, green=0, blue=0.1
+    reflect: 0.5,
+    metallic: 0.5,
+    roughness: 0.0
+  }
+];
+
+selectedId=objects[0].id; refreshTabs(); render(VIEW_W,VIEW_H);
+
+document.getElementById('hint').textContent='note: all rendering is done on cpu.';
+</script>
+</body>
+</html>
